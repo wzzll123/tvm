@@ -24,6 +24,7 @@
 #include <tvm/arith/int_set.h>
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/runtime/registry.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/expr_functor.h>
 
@@ -58,6 +59,16 @@ IntervalSet MakeIntervalSet(PrimExpr min_value, PrimExpr max_value) {
 }
 
 TVM_REGISTER_GLOBAL("arith.IntervalSet").set_body_typed(MakeIntervalSet);
+
+// Upper bound on the complexity of an intersected variable bound that
+// IntervalSetEvaluator will attempt to relax further.  See the comment at
+// IntervalSetEvaluator::VisitExpr_(const VarNode*) for why unbounded
+// relaxation of mutually-referential domains never converges.
+static constexpr size_t kRelaxMaxComplexity = 32;
+
+// Small constant cap on interval-relaxation recursion depth.  See
+// IntervalSetEvaluator::Eval(IntervalSet).
+static constexpr int kMaxRelaxDepth = 4;
 
 IntervalSet Intersect(Analyzer* analyzer, IntervalSet a, IntervalSet b) {
   PrimExpr max_value = min(a->max_value, b->max_value);
@@ -373,14 +384,33 @@ class IntervalSetEvaluator : public ExprFunctor<IntervalSet(const PrimExpr&)> {
   IntervalSet Eval(const PrimExpr& val) { return this->VisitExpr(val); }
   // evaluate and relax the set
   IntervalSet Eval(IntervalSet val) {
-    // avoid recursive indefinite recursive expansion.
-    if (static_cast<size_t>(recur_depth_) >= dom_map_.size()) return val;
+    // Avoid indefinite recursive expansion.  Upstream bounds this by
+    // dom_map_.size(), under the assumption that each variable is relaxed at
+    // most once.  That assumption breaks when variable domains are mutually
+    // referential (e.g. cid's bound mentions vid and vid's bound mentions cid,
+    // as produced by Ascend M-tiling guards such as
+    // min(m_half, M - (cid // n * block_M + vid * m_half))): relaxation then
+    // re-intersects a var's constraints on every round and nests the min/max
+    // endpoints one level deeper, so a depth limit proportional to the number
+    // of variables still allows an expression whose size is exponential in
+    // that count -- observed as a multi-minute lowering hang.  A small
+    // constant depth keeps relaxation useful for genuinely nested domains
+    // while guaranteeing termination.
+    if (recur_depth_ >= kMaxRelaxDepth) return val;
+    size_t budget = tir::CalculateExprComplexity(val->min_value) +
+                    tir::CalculateExprComplexity(val->max_value);
     ++recur_depth_;
     IntervalSet min_set = this->Eval(val->min_value);
     IntervalSet max_set = this->Eval(val->max_value);
     --recur_depth_;
 
-    return IntervalSet(min_set->min_value, max_set->max_value);
+    PrimExpr lo = min_set->min_value;
+    PrimExpr hi = max_set->max_value;
+    if (tir::CalculateExprComplexity(lo) + tir::CalculateExprComplexity(hi) > budget) {
+      // Relaxation made the bounds larger (non-convergent); keep the originals.
+      return val;
+    }
+    return IntervalSet(lo, hi);
   }
 
   IntervalSet VisitExpr_(const IntImmNode* op) final {
@@ -389,6 +419,23 @@ class IntervalSetEvaluator : public ExprFunctor<IntervalSet(const PrimExpr&)> {
 
   IntervalSet VisitExpr_(const VarNode* op) final {
     Var var = GetRef<Var>(op);
+
+    // Memoize per-variable intersection results.  The evaluator is immutable
+    // w.r.t. dom_map_/dom_constraints_ during a single Eval() walk, so the
+    // intersected domain of a given var is constant for the whole walk.
+    // Without this, deeply nested floordiv/min/max index chains (e.g. Ascend
+    // M-tiling guards) re-intersect the same var's constraints on every
+    // occurrence, which can explode combinatorially and hang lowering.
+    // Only the top-level (recur_depth_ == 0) result is cached, because the
+    // recursive relaxation below is depth-limited and may legitimately differ
+    // at deeper recursion levels.
+    bool cacheable = (recur_depth_ == 0);
+    if (cacheable) {
+      auto cache_it = var_domain_cache_.find(var);
+      if (cache_it != var_domain_cache_.end()) {
+        return cache_it->second;
+      }
+    }
 
     Array<IntSet> values;
     if (dom_constraints_) {
@@ -418,11 +465,34 @@ class IntervalSetEvaluator : public ExprFunctor<IntervalSet(const PrimExpr&)> {
 
     IntervalSet res = ToIntervalSet(intersection);
     if (res->min_value.same_as(var) && res->max_value.same_as(var)) {
+      if (cacheable) var_domain_cache_[var] = res;
       return res;
     }
     // recursively evaluate mapped result
     // in case the domain contains variables to be relaxed.
-    return Eval(res);
+    //
+    // Guard against non-convergent relaxation.  When variable domains are
+    // self-referential or mutually referential (e.g. cid's bound mentions vid
+    // and vid's bound mentions cid, as produced by Ascend M-tiling guards such
+    // as min(m_half, M - (cid // n * block_M + vid * m_half))), recursively
+    // relaxing re-enters VarNode and re-intersects the same constraints,
+    // nesting the min/max endpoints one level deeper each round.  The result
+    // set is already a sound interval, so we return it as-is when (a) a bound
+    // still references `var` itself, or (b) the bound is already large -- both
+    // cases where further relaxation cannot converge and only blows up the
+    // expression (observed as a multi-minute lowering hang).
+    size_t res_complexity = tir::CalculateExprComplexity(res->min_value) +
+                            tir::CalculateExprComplexity(res->max_value);
+    bool self_referential =
+        UsesVar(res->min_value, [&var](const VarNode* v) { return var.same_as(GetRef<Var>(v)); }) ||
+        UsesVar(res->max_value, [&var](const VarNode* v) { return var.same_as(GetRef<Var>(v)); });
+    if (self_referential || res_complexity > kRelaxMaxComplexity) {
+      if (cacheable) var_domain_cache_[var] = res;
+      return res;
+    }
+    IntervalSet relaxed = Eval(res);
+    if (cacheable) var_domain_cache_[var] = relaxed;
+    return relaxed;
   }
 
   IntervalSet VisitExpr_(const AddNode* op) final { return VisitBinaryExpr_<Add>(op); }
@@ -562,6 +632,8 @@ class IntervalSetEvaluator : public ExprFunctor<IntervalSet(const PrimExpr&)> {
 
   // recursive depth
   int recur_depth_{0};
+  // per-variable intersection cache for a single Eval() walk (see VarNode)
+  std::unordered_map<Var, IntervalSet, ObjectPtrHash, ObjectPtrEqual> var_domain_cache_;
   // analyzer
   Analyzer* analyzer_;
   const Map<Var, IntSet>& dom_map_;
