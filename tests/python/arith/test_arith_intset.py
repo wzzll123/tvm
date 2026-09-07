@@ -387,5 +387,33 @@ def test_union_lower_bound():
     assert result.max_value.same_as(pos_inf)
 
 
+def test_relax_deep_variable_dependency_chain():
+    """Shared variable bounds must be relaxed once, not once per path."""
+    depth = 64
+    variables = [te.var(f"x{i}") for i in range(depth + 1)]
+    domains = {variables[-1]: tvm.arith.IntervalSet(0, 100)}
+    for i in reversed(range(depth)):
+        domains[variables[i]] = tvm.arith.IntervalSet(
+            variables[i + 1] - 1, variables[i + 1] + 1
+        )
+
+    result = tvm.arith.Analyzer().int_set(variables[0], domains)
+    assert result.min_value.value == -depth
+    assert result.max_value.value == 100 + depth
+
+
+def test_relax_cyclic_variable_dependency():
+    """Mutually-referential bounds must terminate and remain symbolic."""
+    x, y = te.var("x"), te.var("y")
+    domains = {
+        x: tvm.arith.IntervalSet(y - 1, y + 1),
+        y: tvm.arith.IntervalSet(x - 1, x + 1),
+    }
+
+    result = tvm.arith.Analyzer().int_set(x, domains)
+    assert result.min_value is not None
+    assert result.max_value is not None
+
+
 if __name__ == "__main__":
     tvm.testing.main()
