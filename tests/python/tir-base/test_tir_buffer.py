@@ -91,6 +91,24 @@ def test_buffer_vload():
     tvm.ir.assert_structural_equal(load.indices, [2, 3])
 
 
+def test_buffer_explicit_unit_step_dynamic_slice_is_region():
+    """An explicit ``:1`` must not turn a dynamic slice into a Ramp load."""
+    stop = te.size_var("stop")
+    buffer = tvm.tir.decl_buffer((8, 16), "float32")
+
+    region = buffer[0, 0:stop:1]
+
+    assert isinstance(region, tvm.tir.BufferRegion)
+    tvm.testing.assert_prim_expr_equal(region.region[1].min, 0)
+    tvm.ir.assert_structural_equal(region.region[1].extent, stop)
+
+    # A non-unit step remains a vector load; the change is intentionally
+    # limited to the Python-equivalent unit-step spelling.
+    stepped = buffer[0, 0:8:2]
+    assert isinstance(stepped, tvm.tir.BufferLoad)
+    assert isinstance(stepped.indices[1], tvm.tir.Ramp)
+
+
 def test_buffer_offset_of():
     m = te.size_var("m")
     n = te.size_var("n")
